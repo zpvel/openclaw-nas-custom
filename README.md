@@ -21,7 +21,7 @@ Removed from this custom image:
 
 The image is published to:
 
-- `ghcr.io/7461151/openclaw-nas-custom:latest`
+- `ghcr.io/zpvel/openclaw-nas-custom:latest`
 
 ## How It Works
 

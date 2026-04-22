@@ -18,7 +18,7 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: 7461151/openclaw-nas-custom
+  IMAGE_NAME: zpvel/openclaw-nas-custom
   BASE_IMAGE: ghcr.io/openclaw/openclaw:latest
 
 jobs:

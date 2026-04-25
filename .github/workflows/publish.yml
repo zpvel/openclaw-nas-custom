@@ -4,9 +4,11 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - ".github/workflows/publish.yml"
   workflow_dispatch:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "17 8,20 * * *"
 
 permissions:
   contents: read

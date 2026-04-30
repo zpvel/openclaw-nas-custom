@@ -4,7 +4,7 @@ import re
 
 DIST_DIR = Path("/app/dist")
 MARKER = "OPENCLAW_MODEL_REPLY_PREFIX_PATCH"
-PATCH_VERSION = "2026-04-24.1"
+PATCH_VERSION = "2026-04-30.1"
 HELPER_ANCHORS = [
     "/** Shared helper for sending chunked text replies. */",
     "async function parseAndSendMediaTags(replyText, event, actx, sendWithRetry, consumeQuoteRef, deps) {",
@@ -27,7 +27,7 @@ BASE_SNIPPET_GROUPS = [
     ],
 ]
 
-HELPER_BLOCK = r'''const OPENCLAW_MODEL_REPLY_PREFIX_PATCH = "2026-04-24.1";
+HELPER_BLOCK = r'''const OPENCLAW_MODEL_REPLY_PREFIX_PATCH = "2026-04-30.1";
 const OPENCLAW_HOME_DIR = process.env.HOME || "/home/node";
 const OPENCLAW_CONFIG_FILE = path.join(OPENCLAW_HOME_DIR, ".openclaw", "openclaw.json");
 const OPENCLAW_SESSION_STORE_FILE = path.join(OPENCLAW_HOME_DIR, ".openclaw", "agents", "main", "sessions", "sessions.json");
@@ -277,6 +277,28 @@ function buildModelReplyHeader(modelLabel) {
 	if (!normalized) return "";
 	return `\u3010${normalized}\u3011\n`;
 }
+function openclawQqbotShortModelName(fullModel) {
+	const value = normalizeModelRefPart(fullModel);
+	if (!value) return void 0;
+	const slash = value.lastIndexOf("/");
+	return (slash >= 0 ? value.slice(slash + 1) : value).replace(/-\d{8}$/, "").replace(/-latest$/, "");
+}
+function openclawQqbotCreateResponsePrefixContext(cfg, agentId) {
+	const identityName = normalizeOptionalString(cfg?.agents?.[agentId]?.identity?.name) ?? normalizeOptionalString(cfg?.identity?.name);
+	const prefixContext = { identityName };
+	const onModelSelected = (selection) => {
+		const runtimeRef = resolveRuntimeModelRef(cfg, selection);
+		const provider = normalizeModelRefPart(runtimeRef?.provider);
+		const model = normalizeModelRefPart(runtimeRef?.model);
+		if (provider) prefixContext.provider = provider;
+		if (model) {
+			prefixContext.model = openclawQqbotShortModelName(model);
+			prefixContext.modelFull = provider ? `${provider}/${model}` : model;
+		}
+		prefixContext.thinkingLevel = normalizeModelRefPart(selection?.thinkLevel) || "off";
+	};
+	return { prefixContext, onModelSelected, responsePrefixContextProvider: () => prefixContext };
+}
 function stripLeadingModelReplyHeaders(text) {
 	let stripped = normalizeOptionalString(text) ?? "";
 	stripped = stripped.trimStart();
@@ -349,7 +371,7 @@ def find_gateway_file() -> Path:
             continue
         if not matches_gateway_signature(path, text):
             continue
-        if (MARKER in text or "QQBOT_MODEL_LABEL_PATCH" in text) and "dispatchReplyWithBufferedBlockDispatcher({" in text:
+        if (MARKER in text or "QQBOT_MODEL_LABEL_PATCH" in text or "OPENCLAW_QQBOT_DYNAMIC_PREFIX_PATCH" in text) and "dispatchReplyWithBufferedBlockDispatcher({" in text:
             patched_candidates.append(path)
             continue
         fresh_candidates.append(path)
@@ -362,7 +384,7 @@ def find_gateway_file() -> Path:
 
 def ensure_helper_block(text: str) -> str:
     pattern = re.compile(
-        r'const (?:QQBOT_MODEL_LABEL_PATCH|OPENCLAW_MODEL_REPLY_PREFIX_PATCH) = ".*?";\n.*?(?=/\*\* Shared helper for sending chunked text replies\. \*/)',
+        r'const (?:QQBOT_MODEL_LABEL_PATCH|OPENCLAW_MODEL_REPLY_PREFIX_PATCH|OPENCLAW_QQBOT_DYNAMIC_PREFIX_PATCH) = ".*?";\n.*?(?=/\*\* Shared helper for sending chunked text replies\. \*/)',
         re.S,
     )
     if pattern.search(text):
@@ -429,6 +451,22 @@ def patch_once(text: str) -> str:
         ),
         text,
         count=1,
+    )
+
+    text = replace_once_if_needed(
+        text,
+        '\tconst messagesConfig = runtime.channel.reply.resolveEffectiveMessagesConfig(cfg, inbound.route.agentId);\n\tconst useOfficialC2cStream = shouldUseOfficialC2cStream(account, event.type === "c2c" ? "c2c" : event.type === "group" ? "group" : "channel");',
+        '\tconst messagesConfig = runtime.channel.reply.resolveEffectiveMessagesConfig(cfg, inbound.route.agentId);\n\tconst dynamicPrefix = openclawQqbotCreateResponsePrefixContext(cfg, inbound.route.agentId);\n\tconst useOfficialC2cStream = shouldUseOfficialC2cStream(account, event.type === "c2c" ? "c2c" : event.type === "group" ? "group" : "channel");',
+        "const dynamicPrefix = openclawQqbotCreateResponsePrefixContext",
+        "dynamic response prefix context",
+    )
+
+    text = replace_once_if_needed(
+        text,
+        '\t\tdispatcherOptions: {\n\t\t\tresponsePrefix: messagesConfig.responsePrefix,\n\t\t\tdeliver: async (payload, info) => {',
+        '\t\tdispatcherOptions: {\n\t\t\tresponsePrefix: messagesConfig.responsePrefix,\n\t\t\tresponsePrefixContextProvider: dynamicPrefix.responsePrefixContextProvider,\n\t\t\tdeliver: async (payload, info) => {',
+        "responsePrefixContextProvider: dynamicPrefix.responsePrefixContextProvider",
+        "dynamic response prefix provider",
     )
 
     text = replace_variant_if_needed(
@@ -597,12 +635,17 @@ def patch_once(text: str) -> str:
         )
         text = deliver_actx_pattern.sub(deliver_replacement, text, count=1)
 
-    if "onModelSelected: (selection) => {" not in text:
-        old_reply_options = 'replyOptions: { disableBlockStreaming: account.config.streaming?.mode === "off" }'
-        new_reply_options = 'replyOptions: {\n\t\t\t\t\t\t\tdisableBlockStreaming: account.config.streaming?.mode === "off",\n\t\t\t\t\t\t\tonModelSelected: (selection) => {\n\t\t\t\t\t\t\t\tupdateCurrentModelLabel(selection);\n\t\t\t\t\t\t\t}\n\t\t\t\t\t\t}'
-        if old_reply_options not in text:
+    if "onModelSelected:" not in text:
+        compact_old = 'replyOptions: { disableBlockStreaming: account.config.streaming?.mode === "off" }'
+        compact_new = 'replyOptions: {\n\t\t\t\t\t\t\tdisableBlockStreaming: account.config.streaming?.mode === "off",\n\t\t\t\t\t\t\tonModelSelected: (selection) => {\n\t\t\t\t\t\t\t\tdynamicPrefix.onModelSelected(selection);\n\t\t\t\t\t\t\t\tupdateCurrentModelLabel(selection);\n\t\t\t\t\t\t\t}\n\t\t\t\t\t\t}'
+        multiline_old = '\t\treplyOptions: {\n\t\t\tdisableBlockStreaming: useOfficialC2cStream ? true : (() => {'
+        multiline_new = '\t\treplyOptions: {\n\t\t\tonModelSelected: (selection) => {\n\t\t\t\tdynamicPrefix.onModelSelected(selection);\n\t\t\t\tupdateCurrentModelLabel(selection);\n\t\t\t},\n\t\t\tdisableBlockStreaming: useOfficialC2cStream ? true : (() => {'
+        if compact_old in text:
+            text = text.replace(compact_old, compact_new, 1)
+        elif multiline_old in text:
+            text = text.replace(multiline_old, multiline_new, 1)
+        else:
             raise RuntimeError("replyOptions anchor missing")
-        text = text.replace(old_reply_options, new_reply_options, 1)
 
     return text
 

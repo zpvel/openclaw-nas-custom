@@ -4,7 +4,7 @@ import re
 
 DIST_DIR = Path("/app/dist")
 MARKER = "OPENCLAW_MODEL_REPLY_PREFIX_PATCH"
-PATCH_VERSION = "2026-04-30.2"
+PATCH_VERSION = "2026-05-01.1"
 HELPER_ANCHORS = [
     "/** Shared helper for sending chunked text replies. */",
     "async function parseAndSendMediaTags(replyText, event, actx, sendWithRetry, consumeQuoteRef, deps) {",
@@ -27,7 +27,7 @@ BASE_SNIPPET_GROUPS = [
     ],
 ]
 
-HELPER_BLOCK = r'''const OPENCLAW_MODEL_REPLY_PREFIX_PATCH = "2026-04-30.2";
+HELPER_BLOCK = r'''const OPENCLAW_MODEL_REPLY_PREFIX_PATCH = "2026-05-01.1";
 const OPENCLAW_HOME_DIR = process.env.HOME || "/home/node";
 const OPENCLAW_CONFIG_FILE = path.join(OPENCLAW_HOME_DIR, ".openclaw", "openclaw.json");
 const OPENCLAW_SESSION_STORE_FILE = path.join(OPENCLAW_HOME_DIR, ".openclaw", "agents", "main", "sessions", "sessions.json");
@@ -485,17 +485,36 @@ def patch_once(text: str) -> str:
         "dynamic response prefix context",
     )
 
-    text = replace_once_if_needed(
+    if "responsePrefixContextProvider: dynamicPrefix.responsePrefixContextProvider" not in text:
+        dispatcher_options_pattern = re.compile(
+            r'(?m)^(?P<indent>[ \t]*)dispatcherOptions: \{\n'
+            r'(?P<child>[ \t]*)responsePrefix: messagesConfig\.responsePrefix,\n'
+            r'(?P=child)deliver: async \(payload, info\) => \{'
+        )
+        dispatcher_options_match = dispatcher_options_pattern.search(text)
+        if not dispatcher_options_match:
+            raise RuntimeError("dynamic response prefix provider anchor missing")
+        indent = dispatcher_options_match.group("indent")
+        child = dispatcher_options_match.group("child")
+        text = dispatcher_options_pattern.sub(
+            (
+                f"{indent}dispatcherOptions: {{\n"
+                f"{child}responsePrefix: undefined,\n"
+                f"{child}responsePrefixContextProvider: dynamicPrefix.responsePrefixContextProvider,\n"
+                f"{child}deliver: async (payload, info) => {{"
+            ),
+            text,
+            count=1,
+        )
+    text = re.sub(
+        r'(?m)^(?P<indent>[ \t]*)responsePrefix: messagesConfig\.responsePrefix,\n'
+        r'(?P=indent)responsePrefixContextProvider: dynamicPrefix\.responsePrefixContextProvider,',
+        lambda match: (
+            f"{match.group('indent')}responsePrefix: undefined,\n"
+            f"{match.group('indent')}responsePrefixContextProvider: dynamicPrefix.responsePrefixContextProvider,"
+        ),
         text,
-        '\t\tdispatcherOptions: {\n\t\t\tresponsePrefix: messagesConfig.responsePrefix,\n\t\t\tdeliver: async (payload, info) => {',
-        '\t\tdispatcherOptions: {\n\t\t\tresponsePrefix: undefined,\n\t\t\tresponsePrefixContextProvider: dynamicPrefix.responsePrefixContextProvider,\n\t\t\tdeliver: async (payload, info) => {',
-        "responsePrefixContextProvider: dynamicPrefix.responsePrefixContextProvider",
-        "dynamic response prefix provider",
-    )
-    text = text.replace(
-        "\t\t\tresponsePrefix: messagesConfig.responsePrefix,\n\t\t\tresponsePrefixContextProvider: dynamicPrefix.responsePrefixContextProvider,",
-        "\t\t\tresponsePrefix: undefined,\n\t\t\tresponsePrefixContextProvider: dynamicPrefix.responsePrefixContextProvider,",
-        1,
+        count=1,
     )
 
     text = replace_variant_if_needed(
@@ -623,19 +642,22 @@ def patch_once(text: str) -> str:
     )
 
     if "let currentModelLabel = resolveReplyModelLabel(" not in text:
-        pattern = re.compile(r'(?m)^([ \t]*)const dispatchPromise = ((?:pluginRuntime|runtime))\.channel\.reply\.dispatchReplyWithBufferedBlockDispatcher\(\{')
+        pattern = re.compile(
+            r'(?m)^([ \t]*)const dispatchPromise = '
+            r'((?:(?:pluginRuntime|runtime))\.channel\.reply\.dispatchReplyWithBufferedBlockDispatcher\(\{|runtime\.channel\.turn\.run\(\{)'
+        )
         match = pattern.search(text)
         if not match:
             raise RuntimeError("dispatchPromise anchor missing")
         indent = match.group(1)
-        runtime_name = match.group(2)
+        dispatch_call = match.group(2)
         injection = (
             f"{indent}let currentModelLabel = resolveReplyModelLabel({session_key_expr}, cfg, {agent_id_expr});\n"
             f"{indent}const updateCurrentModelLabel = (selection) => {{\n"
             f"{indent}\tconst runtimeModelLabel = resolveRuntimeReplyModelLabel(cfg, selection);\n"
             f"{indent}\tif (runtimeModelLabel) currentModelLabel = runtimeModelLabel;\n"
             f"{indent}}};\n"
-            f"{indent}const dispatchPromise = {runtime_name}.channel.reply.dispatchReplyWithBufferedBlockDispatcher({{"
+            f"{indent}const dispatchPromise = {dispatch_call}"
         )
         text = pattern.sub(lambda _m: injection, text, count=1)
 
@@ -667,14 +689,30 @@ def patch_once(text: str) -> str:
     if "onModelSelected:" not in text:
         compact_old = 'replyOptions: { disableBlockStreaming: account.config.streaming?.mode === "off" }'
         compact_new = 'replyOptions: {\n\t\t\t\t\t\t\tdisableBlockStreaming: account.config.streaming?.mode === "off",\n\t\t\t\t\t\t\tonModelSelected: (selection) => {\n\t\t\t\t\t\t\t\tdynamicPrefix.onModelSelected(selection);\n\t\t\t\t\t\t\t\tupdateCurrentModelLabel(selection);\n\t\t\t\t\t\t\t}\n\t\t\t\t\t\t}'
-        multiline_old = '\t\treplyOptions: {\n\t\t\tdisableBlockStreaming: useOfficialC2cStream ? true : (() => {'
-        multiline_new = '\t\treplyOptions: {\n\t\t\tonModelSelected: (selection) => {\n\t\t\t\tdynamicPrefix.onModelSelected(selection);\n\t\t\t\tupdateCurrentModelLabel(selection);\n\t\t\t},\n\t\t\tdisableBlockStreaming: useOfficialC2cStream ? true : (() => {'
+        reply_options_pattern = re.compile(
+            r'(?m)^(?P<indent>[ \t]*)replyOptions: \{\n'
+            r'(?P<child>[ \t]*)disableBlockStreaming:'
+        )
         if compact_old in text:
             text = text.replace(compact_old, compact_new, 1)
-        elif multiline_old in text:
-            text = text.replace(multiline_old, multiline_new, 1)
         else:
-            raise RuntimeError("replyOptions anchor missing")
+            reply_options_match = reply_options_pattern.search(text)
+            if not reply_options_match:
+                raise RuntimeError("replyOptions anchor missing")
+            indent = reply_options_match.group("indent")
+            child = reply_options_match.group("child")
+            text = reply_options_pattern.sub(
+                (
+                    f"{indent}replyOptions: {{\n"
+                    f"{child}onModelSelected: (selection) => {{\n"
+                    f"{child}\tdynamicPrefix.onModelSelected(selection);\n"
+                    f"{child}\tupdateCurrentModelLabel(selection);\n"
+                    f"{child}}},\n"
+                    f"{child}disableBlockStreaming:"
+                ),
+                text,
+                count=1,
+            )
 
     return text
 

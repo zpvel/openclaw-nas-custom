@@ -5,6 +5,7 @@ import re
 DIST_DIR = Path("/app/dist")
 MARKER = "OPENCLAW_MODEL_REPLY_PREFIX_PATCH"
 PATCH_VERSION = "2026-05-01.1"
+NAS_PERF_PATCH_VERSION = "2026-05-01.3"
 HELPER_ANCHORS = [
     "/** Shared helper for sending chunked text replies. */",
     "async function parseAndSendMediaTags(replyText, event, actx, sendWithRetry, consumeQuoteRef, deps) {",
@@ -717,15 +718,264 @@ def patch_once(text: str) -> str:
     return text
 
 
+def find_dist_file(pattern: str, required_text: str) -> Path:
+    candidates = []
+    for candidate in DIST_DIR.glob(pattern):
+        try:
+            if required_text in candidate.read_text(encoding="utf-8", errors="ignore"):
+                candidates.append(candidate)
+        except OSError:
+            continue
+    if not candidates:
+        raise RuntimeError(f"dist file missing for {pattern}")
+    candidates.sort(key=lambda item: item.name)
+    return candidates[0]
+
+
+def patch_selection_runtime(text: str) -> str:
+    text = text.replace(
+        "const skipNasBundleTools = params.config?.agents?.defaults?.embeddedPi?.skipBundleTools === true;",
+        'const skipNasBundleTools = process.env.OPENCLAW_NAS_SKIP_BUNDLE_TOOLS !== "0";',
+        1,
+    )
+    if "const skipNasBundleTools = params.config?.agents?.defaults?.embeddedPi?.skipBundleTools === true;" not in text:
+        text = replace_once_if_needed(
+            text,
+            "\t\tconst bundleMcpSessionRuntime = shouldCreateBundleMcpRuntimeForAttempt({",
+            '\t\tconst skipNasBundleTools = process.env.OPENCLAW_NAS_SKIP_BUNDLE_TOOLS !== "0";\n\t\tconst bundleMcpSessionRuntime = !skipNasBundleTools && shouldCreateBundleMcpRuntimeForAttempt({',
+            'const skipNasBundleTools = process.env.OPENCLAW_NAS_SKIP_BUNDLE_TOOLS !== "0";',
+            "selection skip bundle MCP",
+        )
+
+    text = replace_once_if_needed(
+        text,
+        "\t\tconst bundleLspRuntime = toolsEnabled && !isRawModelRun ? await createBundleLspToolRuntime({",
+        "\t\tconst bundleLspRuntime = !skipNasBundleTools && toolsEnabled && !isRawModelRun ? await createBundleLspToolRuntime({",
+        "const bundleLspRuntime = !skipNasBundleTools && toolsEnabled && !isRawModelRun ? await createBundleLspToolRuntime({",
+        "selection skip bundle LSP",
+    )
+
+    text = text.replace(
+        "const configuredPromptMode = params.config?.agents?.defaults?.embeddedPi?.promptMode;",
+        'const configuredPromptMode = process.env.OPENCLAW_NAS_PROMPT_MODE || "minimal";',
+        1,
+    )
+    text = replace_once_if_needed(
+        text,
+        '\t\tconst promptMode = params.promptMode ?? (isRawModelRun ? "none" : resolvePromptModeForSession(params.sessionKey));',
+        '\t\tconst configuredPromptMode = process.env.OPENCLAW_NAS_PROMPT_MODE || "minimal";\n\t\tconst promptMode = params.promptMode ?? (isRawModelRun ? "none" : configuredPromptMode === "minimal" || configuredPromptMode === "full" || configuredPromptMode === "none" ? configuredPromptMode : resolvePromptModeForSession(params.sessionKey));',
+        'const configuredPromptMode = process.env.OPENCLAW_NAS_PROMPT_MODE || "minimal";',
+        "selection configured prompt mode",
+    )
+    return text
+
+
+def patch_qqbot_sender_timeout(text: str) -> str:
+    return replace_once_if_needed(
+        text,
+        "const DEFAULT_TIMEOUT_MS = 3e4;",
+        "const DEFAULT_TIMEOUT_MS = Math.max(1e3, Number(process.env.QQBOT_API_TIMEOUT_MS || 8e3) || 8e3);",
+        "process.env.QQBOT_API_TIMEOUT_MS",
+        "qqbot API timeout",
+    )
+
+
+def patch_provider_runtime(text: str) -> str:
+    helper = '''const OPENCLAW_NAS_BUILTIN_PROVIDER_IDS = new Set([
+\t"openai",
+\t"anthropic",
+\t"google",
+\t"google-gemini",
+\t"amazon-bedrock",
+\t"amazon-bedrock-mantle",
+\t"azure-openai",
+\t"openrouter",
+\t"ollama",
+\t"lmstudio",
+\t"mistral",
+\t"deepseek",
+\t"qwen",
+\t"volcengine",
+\t"alibaba",
+\t"groq",
+\t"xai",
+\t"perplexity"
+]);
+function shouldNasSkipCustomProviderPluginLookup(params) {
+\tif (process.env.OPENCLAW_NAS_SKIP_CUSTOM_PROVIDER_PLUGINS === "0") return false;
+\tconst providerId = normalizeLowercaseStringOrEmpty(params?.provider);
+\tif (!providerId || OPENCLAW_NAS_BUILTIN_PROVIDER_IDS.has(providerId)) return false;
+\tconst providers = params?.config?.models?.providers;
+\tif (!providers || typeof providers !== "object") return false;
+\tconst configured = providers[params.provider] ?? providers[providerId];
+\tif (!configured || typeof configured !== "object") return false;
+\tif (configured.plugin || configured.providerPlugin || configured.runtimePlugin) return false;
+\tconst api = normalizeLowercaseStringOrEmpty(params?.context?.model?.api ?? params?.context?.modelApi ?? configured.api);
+\tif (!api) return Boolean(configured.baseUrl);
+\treturn Boolean(configured.baseUrl) || api.includes("openai") || api.includes("anthropic") || api.includes("compatible");
+}
+'''
+    if "function shouldNasSkipCustomProviderPluginLookup(params)" not in text:
+        text = replace_once_if_needed(
+            text,
+            "function resolveProviderPluginsForHooks(params) {",
+            helper + "function resolveProviderPluginsForHooks(params) {",
+            "function shouldNasSkipCustomProviderPluginLookup(params)",
+            "provider runtime custom-provider skip helper",
+        )
+
+    text = replace_once_if_needed(
+        text,
+        "function resolveProviderRuntimePlugin(params) {\n\tconst apiOwnerHint = resolveProviderConfigApiOwnerHint({",
+        "function resolveProviderRuntimePlugin(params) {\n\tif (shouldNasSkipCustomProviderPluginLookup(params)) return;\n\tconst apiOwnerHint = resolveProviderConfigApiOwnerHint({",
+        "if (shouldNasSkipCustomProviderPluginLookup(params)) return;",
+        "provider runtime custom-provider runtime skip",
+    )
+
+    text = replace_once_if_needed(
+        text,
+        "function resolveProviderHookPlugin(params) {\n\treturn resolveProviderRuntimePlugin(params) ?? resolveProviderPluginsForHooks({",
+        "function resolveProviderHookPlugin(params) {\n\tif (shouldNasSkipCustomProviderPluginLookup(params)) return;\n\treturn resolveProviderRuntimePlugin(params) ?? resolveProviderPluginsForHooks({",
+        "function resolveProviderHookPlugin(params) {\n\tif (shouldNasSkipCustomProviderPluginLookup(params)) return;",
+        "provider runtime custom-provider hook skip",
+    )
+    return text
+
+
+def patch_openclaw_tools_runtime(text: str) -> str:
+    text = replace_once_if_needed(
+        text,
+        "\tconst runtimeWebTools = getActiveRuntimeWebToolsMetadata();",
+        '\tconst nasSkipMediaTools = process.env.OPENCLAW_NAS_SKIP_MEDIA_TOOLS !== "0";\n\tconst runtimeWebTools = getActiveRuntimeWebToolsMetadata();',
+        "const nasSkipMediaTools = process.env.OPENCLAW_NAS_SKIP_MEDIA_TOOLS",
+        "openclaw tools media skip flag",
+    )
+    text = replace_once_if_needed(
+        text,
+        "\tconst imageTool = options?.agentDir?.trim() ? createImageTool({",
+        "\tconst imageTool = !nasSkipMediaTools && options?.agentDir?.trim() ? createImageTool({",
+        "const imageTool = !nasSkipMediaTools && options?.agentDir?.trim() ? createImageTool({",
+        "openclaw tools skip image tool",
+    )
+    text = replace_once_if_needed(
+        text,
+        "\tconst imageGenerateTool = createImageGenerateTool({",
+        "\tconst imageGenerateTool = nasSkipMediaTools ? null : createImageGenerateTool({",
+        "const imageGenerateTool = nasSkipMediaTools ? null : createImageGenerateTool({",
+        "openclaw tools skip image generation",
+    )
+    text = replace_once_if_needed(
+        text,
+        "\tconst videoGenerateTool = createVideoGenerateTool({",
+        "\tconst videoGenerateTool = nasSkipMediaTools ? null : createVideoGenerateTool({",
+        "const videoGenerateTool = nasSkipMediaTools ? null : createVideoGenerateTool({",
+        "openclaw tools skip video generation",
+    )
+    text = replace_once_if_needed(
+        text,
+        "\tconst musicGenerateTool = createMusicGenerateTool({",
+        "\tconst musicGenerateTool = nasSkipMediaTools ? null : createMusicGenerateTool({",
+        "const musicGenerateTool = nasSkipMediaTools ? null : createMusicGenerateTool({",
+        "openclaw tools skip music generation",
+    )
+    text = replace_once_if_needed(
+        text,
+        "\tconst pdfTool = options?.agentDir?.trim() ? createPdfTool({",
+        "\tconst pdfTool = !nasSkipMediaTools && options?.agentDir?.trim() ? createPdfTool({",
+        "const pdfTool = !nasSkipMediaTools && options?.agentDir?.trim() ? createPdfTool({",
+        "openclaw tools skip pdf tool",
+    )
+    text = replace_once_if_needed(
+        text,
+        "\t\tcreateTtsTool({\n\t\t\tagentChannel: options?.agentChannel,\n\t\t\tconfig: resolvedConfig,\n\t\t\tagentId: sessionAgentId,\n\t\t\tagentAccountId: options?.agentAccountId\n\t\t}),",
+        "\t\t...(nasSkipMediaTools ? [] : [createTtsTool({\n\t\t\tagentChannel: options?.agentChannel,\n\t\t\tconfig: resolvedConfig,\n\t\t\tagentId: sessionAgentId,\n\t\t\tagentAccountId: options?.agentAccountId\n\t\t})]),",
+        "...(nasSkipMediaTools ? [] : [createTtsTool({",
+        "openclaw tools skip tts tool",
+    )
+    return text
+
+
+def patch_nas_task_performance() -> None:
+    selection_file = find_dist_file("selection-*.js", "const bundleMcpSessionRuntime =")
+    selection_original = selection_file.read_text(encoding="utf-8")
+    selection_patched = patch_selection_runtime(selection_original)
+    if selection_patched == selection_original:
+        log(f"already patched: {selection_file.name} nas-task ({NAS_PERF_PATCH_VERSION})")
+    else:
+        selection_file.write_text(selection_patched, encoding="utf-8")
+        log(f"patched {selection_file.name} nas-task -> {NAS_PERF_PATCH_VERSION}")
+
+    sender_file = find_dist_file("extensions/qqbot/sender-*.js", "const DEFAULT_TIMEOUT_MS =")
+    sender_original = sender_file.read_text(encoding="utf-8")
+    sender_patched = patch_qqbot_sender_timeout(sender_original)
+    if sender_patched == sender_original:
+        log(f"already patched: {sender_file.name} timeout ({NAS_PERF_PATCH_VERSION})")
+    else:
+        sender_file.write_text(sender_patched, encoding="utf-8")
+        log(f"patched {sender_file.name} timeout -> {NAS_PERF_PATCH_VERSION}")
+
+    provider_runtime_file = find_dist_file("provider-runtime-*.js", "function resolveProviderRuntimePlugin")
+    provider_runtime_original = provider_runtime_file.read_text(encoding="utf-8")
+    provider_runtime_patched = patch_provider_runtime(provider_runtime_original)
+    if provider_runtime_patched == provider_runtime_original:
+        log(f"already patched: {provider_runtime_file.name} provider-runtime ({NAS_PERF_PATCH_VERSION})")
+    else:
+        provider_runtime_file.write_text(provider_runtime_patched, encoding="utf-8")
+        log(f"patched {provider_runtime_file.name} provider-runtime -> {NAS_PERF_PATCH_VERSION}")
+
+    openclaw_tools_file = find_dist_file("openclaw-tools-*.js", "function createOpenClawTools")
+    openclaw_tools_original = openclaw_tools_file.read_text(encoding="utf-8")
+    openclaw_tools_patched = patch_openclaw_tools_runtime(openclaw_tools_original)
+    if openclaw_tools_patched == openclaw_tools_original:
+        log(f"already patched: {openclaw_tools_file.name} openclaw-tools ({NAS_PERF_PATCH_VERSION})")
+    else:
+        openclaw_tools_file.write_text(openclaw_tools_patched, encoding="utf-8")
+        log(f"patched {openclaw_tools_file.name} openclaw-tools -> {NAS_PERF_PATCH_VERSION}")
+
+
+def ensure_nas_task_config() -> None:
+    config_file = Path("/home/node/.openclaw/openclaw.json")
+    try:
+        import json
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        cfg = json.loads(config_file.read_text(encoding="utf-8")) if config_file.exists() else {}
+        if not isinstance(cfg, dict):
+            raise RuntimeError("openclaw.json is not an object")
+        agents = cfg.setdefault("agents", {})
+        defaults = agents.setdefault("defaults", {})
+        embedded = defaults.setdefault("embeddedPi", {})
+        changed = False
+        for invalid_key in ("skipBundleTools", "promptMode"):
+            if invalid_key in embedded:
+                embedded.pop(invalid_key, None)
+                changed = True
+        if not embedded:
+            defaults.pop("embeddedPi", None)
+            changed = True
+        tools = cfg.setdefault("tools", {})
+        if tools.get("profile") != "coding":
+            tools["profile"] = "coding"
+            changed = True
+        if changed:
+            config_file.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            log("updated openclaw.json nas task-safe defaults")
+        else:
+            log("openclaw.json nas task-safe defaults already set")
+    except Exception as exc:
+        log(f"nas task config update skipped: {exc}")
+
+
 def main() -> int:
     gateway_file = find_gateway_file()
     original = gateway_file.read_text(encoding="utf-8")
     patched = patch_once(original)
     if patched == original:
         log(f"already patched: {gateway_file.name} ({PATCH_VERSION})")
-        return 0
-    gateway_file.write_text(patched, encoding="utf-8")
-    log(f"patched {gateway_file.name} -> {PATCH_VERSION}")
+    else:
+        gateway_file.write_text(patched, encoding="utf-8")
+        log(f"patched {gateway_file.name} -> {PATCH_VERSION}")
+    patch_nas_task_performance()
+    ensure_nas_task_config()
     return 0
 
 

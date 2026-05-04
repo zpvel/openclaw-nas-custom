@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from pathlib import Path
 import re
+import shutil
 
 DIST_DIR = Path("/app/dist")
 MARKER = "OPENCLAW_MODEL_REPLY_PREFIX_PATCH"
@@ -380,6 +381,36 @@ def matches_gateway_signature(path: Path, text: str) -> bool:
     normalized_path = str(path).replace("\\", "/").lower()
     is_qqbot_gateway = "/qqbot/" in normalized_path or 'Provider: "qqbot"' in text or 'channel: "qqbot"' in text
     return is_qqbot_gateway and any(all(snippet in text for snippet in group) for group in BASE_SNIPPET_GROUPS)
+
+
+def ensure_qqbot_dist() -> None:
+    target = DIST_DIR / "extensions" / "qqbot"
+    if (target / "index.js").exists():
+        return
+
+    deps_root = Path("/home/node/.openclaw/plugin-runtime-deps")
+    candidates = []
+    if deps_root.exists():
+        for candidate in deps_root.glob("openclaw-*/dist/extensions/qqbot"):
+            if (candidate / "index.js").exists():
+                candidates.append(candidate)
+    candidates.sort(key=lambda item: item.as_posix(), reverse=True)
+
+    if not candidates:
+        log("qqbot dist restore skipped: no bundled runtime candidate found")
+        return
+
+    source = candidates[0]
+    target.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, target, dirs_exist_ok=True)
+
+    current_source = Path("/app/extensions/qqbot")
+    for name in ("openclaw.plugin.json", "package.json"):
+        current_file = current_source / name
+        if current_file.exists():
+            shutil.copy2(current_file, target / name)
+
+    log(f"restored qqbot dist runtime files from {source}")
 
 
 def find_gateway_file() -> Path:
@@ -923,14 +954,17 @@ def patch_nas_task_performance() -> None:
         provider_runtime_file.write_text(provider_runtime_patched, encoding="utf-8")
         log(f"patched {provider_runtime_file.name} provider-runtime -> {NAS_PERF_PATCH_VERSION}")
 
-    openclaw_tools_file = find_dist_file("openclaw-tools-*.js", "function createOpenClawTools")
-    openclaw_tools_original = openclaw_tools_file.read_text(encoding="utf-8")
-    openclaw_tools_patched = patch_openclaw_tools_runtime(openclaw_tools_original)
-    if openclaw_tools_patched == openclaw_tools_original:
-        log(f"already patched: {openclaw_tools_file.name} openclaw-tools ({NAS_PERF_PATCH_VERSION})")
-    else:
-        openclaw_tools_file.write_text(openclaw_tools_patched, encoding="utf-8")
-        log(f"patched {openclaw_tools_file.name} openclaw-tools -> {NAS_PERF_PATCH_VERSION}")
+    try:
+        openclaw_tools_file = find_dist_file("openclaw-tools-*.js", "function createOpenClawTools")
+        openclaw_tools_original = openclaw_tools_file.read_text(encoding="utf-8")
+        openclaw_tools_patched = patch_openclaw_tools_runtime(openclaw_tools_original)
+        if openclaw_tools_patched == openclaw_tools_original:
+            log(f"already patched: {openclaw_tools_file.name} openclaw-tools ({NAS_PERF_PATCH_VERSION})")
+        else:
+            openclaw_tools_file.write_text(openclaw_tools_patched, encoding="utf-8")
+            log(f"patched {openclaw_tools_file.name} openclaw-tools -> {NAS_PERF_PATCH_VERSION}")
+    except RuntimeError as exc:
+        log(f"openclaw-tools optional patch skipped: {exc}")
 
 
 def ensure_nas_task_config() -> None:
@@ -966,7 +1000,13 @@ def ensure_nas_task_config() -> None:
 
 
 def main() -> int:
-    gateway_file = find_gateway_file()
+    ensure_qqbot_dist()
+    try:
+        gateway_file = find_gateway_file()
+    except RuntimeError as exc:
+        log(f"qqbot model label patch skipped: {exc}")
+        ensure_nas_task_config()
+        return 0
     original = gateway_file.read_text(encoding="utf-8")
     patched = patch_once(original)
     if patched == original:

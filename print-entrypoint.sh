@@ -68,6 +68,28 @@ apply_qqbot_model_label_patch() {
   fi
 }
 
+ensure_qqbot_plugin() {
+  if openclaw plugins list 2>/tmp/qqbot-plugin-list.err | grep -qi 'stock:qqbot/index.js\|qqbot.*enabled'; then
+    return 0
+  fi
+
+  version="$(node -p 'require("/app/package.json").version' 2>/dev/null || true)"
+  if [ -z "$version" ]; then
+    log "qqbot plugin install skipped: unable to resolve OpenClaw version"
+    cat /tmp/qqbot-plugin-list.err 2>/dev/null | while IFS= read -r line; do log "$line"; done || true
+    return 0
+  fi
+
+  spec="@openclaw/qqbot@$version"
+  log "qqbot plugin unavailable; installing $spec"
+  if openclaw plugins install "$spec" --force >/tmp/qqbot-plugin-install.out 2>/tmp/qqbot-plugin-install.err; then
+    cat /tmp/qqbot-plugin-install.out 2>/dev/null | while IFS= read -r line; do log "$line"; done || true
+  else
+    log "qqbot plugin install failed"
+    cat /tmp/qqbot-plugin-install.err 2>/dev/null | while IFS= read -r line; do log "$line"; done || true
+  fi
+}
+
 ensure_browser_config() {
   config_path="/home/node/.openclaw/openclaw.json"
 
@@ -109,6 +131,7 @@ PY
 
 start_cups
 configure_printer
+ensure_qqbot_plugin
 apply_qqbot_model_label_patch
 ensure_browser_config
 
